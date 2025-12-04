@@ -1,0 +1,472 @@
+﻿#include <windows.h>
+#include <shlobj.h>
+#include <iostream>
+#include <string>
+#include <vector>
+#include <thread>
+#include <atomic>
+#include <map>
+#include <set>
+#include <chrono>
+#include <filesystem>
+#include <restartmanager.h>
+
+#pragma comment(lib, "Rstrtmgr.lib")
+
+#define UNKUOWN				L"unknown"
+#define UNKUOWN_NO_ORIGIN	L"unknown_no_original_file_found"
+#define UNKUOWN_MAYBE_DEL	L"unknown_maybe_delete"
+
+static const std::set<std::wstring> target_extensions = {
+	L".txt", L".doc", L".docx", L".pdf", L".xls", L".xlsx", L".ppt", L".pptx"
+};
+
+bool is_target_file_ext(std::wstring file_name) {
+	std::filesystem::path file_path = file_name;
+	std::filesystem::path ext = file_path.extension();
+
+	// 2. 检查是否有扩展名
+	if (ext.empty()) {
+		return false;
+	}
+	else {
+		return target_extensions.find(ext.wstring()) != target_extensions.end();
+	}
+}
+
+bool is_file_locked_by_RM(const std::wstring& filePath) {
+	DWORD sessionHandle;
+	WCHAR sessionKey[CCH_RM_SESSION_KEY + 1] = { 0 };
+
+	// 创建重启管理器会话
+	DWORD result = RmStartSession(&sessionHandle, 0, sessionKey);
+	if (result != ERROR_SUCCESS) {
+		return false;
+	}
+
+	// 注册要检查的文件
+	PCWSTR files[] = { filePath.c_str() };
+	result = RmRegisterResources(sessionHandle, 1, files, 0, NULL, 0, NULL);
+	if (result != ERROR_SUCCESS) {
+		RmEndSession(sessionHandle);
+		return false;
+	}
+
+	// 获取文件使用信息
+	DWORD reason;
+	UINT processInfoNeeded;
+	UINT processInfoCount = 0;
+	RM_PROCESS_INFO* processInfo = NULL;
+
+	result = RmGetList(sessionHandle, &processInfoNeeded, &processInfoCount,
+		processInfo, &reason);
+
+	RmEndSession(sessionHandle);
+
+	// 如果有进程在使用该文件
+	return (result == ERROR_MORE_DATA && processInfoNeeded > 0);
+}
+
+// 简单的宽字符转UTF-8 string 辅助函数
+std::string WStringToString(const std::wstring& wstr) {
+	if (wstr.empty()) return std::string();
+	int size_needed = WideCharToMultiByte(CP_UTF8, 0, &wstr[0], (int)wstr.size(), NULL, 0, NULL, NULL);
+	std::string strTo(size_needed, 0);
+	WideCharToMultiByte(CP_UTF8, 0, &wstr[0], (int)wstr.size(), &strTo[0], size_needed, NULL, NULL);
+	return strTo;
+}
+
+class DirectoryMonitor {
+private:
+	std::wstring directory_path_;
+	HANDLE directory_handle_;
+	std::atomic<bool> stop_monitoring_;
+	std::thread monitor_thread_;
+
+	// --- 新增：用于去重的结构 ---
+	struct FileEventState {
+		DWORD last_action;
+		std::chrono::steady_clock::time_point last_time;
+	};
+
+	// 记录文件路径对应的状态
+	std::map<std::wstring, FileEventState> event_cache_;
+	// 冷却时间（毫秒）：在此时间内重复的事件会被忽略
+	const int kCooldownMs = 500;
+	// --- 结束新增 ---
+
+public:
+	DirectoryMonitor(const std::wstring& directory_path)
+		: directory_path_(directory_path), directory_handle_(INVALID_HANDLE_VALUE), stop_monitoring_(false) {
+	}
+
+	~DirectoryMonitor() {
+		stop();
+	}
+
+	bool start() {
+		// 打开目录句柄
+		directory_handle_ = CreateFileW(
+			directory_path_.c_str(),
+			FILE_LIST_DIRECTORY,
+			FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+			NULL,
+			OPEN_EXISTING,
+			FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OVERLAPPED,
+			NULL
+		);
+
+		if (directory_handle_ == INVALID_HANDLE_VALUE) {
+			std::wcerr << L"cannot open directory: " << directory_path_
+				<< L", error code: " << GetLastError() << std::endl;
+			return false;
+		}
+
+		stop_monitoring_ = false;
+		monitor_thread_ = std::thread(&DirectoryMonitor::monitor_loop, this);
+		return true;
+	}
+
+	void stop() {
+		stop_monitoring_ = true;
+		if (directory_handle_ != INVALID_HANDLE_VALUE) {
+			CancelIo(directory_handle_);
+			CloseHandle(directory_handle_);
+			directory_handle_ = INVALID_HANDLE_VALUE;
+		}
+		if (monitor_thread_.joinable()) {
+			monitor_thread_.join();
+		}
+	}
+
+private:
+	std::wstring find_original_file(const std::wstring& directory, const std::wstring& tempFileName) {
+		// 1. 提取共同后缀 (去掉 ~$)
+		if (tempFileName.length() < 3) return UNKUOWN;
+		std::wstring suffix = tempFileName.substr(2); // 比如 ~$port.docx -> port.docx
+
+		// 2. 遍历目录寻找匹配项
+		std::wstring searchPattern = directory + L"\\*" + suffix; // 搜索 *port.docx
+
+		WIN32_FIND_DATAW findData;
+		HANDLE hFind = FindFirstFileW(searchPattern.c_str(), &findData);
+
+		if (hFind == INVALID_HANDLE_VALUE) return UNKUOWN_NO_ORIGIN;
+
+		std::wstring result = L"";
+		do {
+			std::wstring currentFile = findData.cFileName;
+			// 排除临时文件自己
+			if (currentFile == tempFileName) continue;
+
+			// 简单的长度匹配检查 (Office 只是替换前两个字符，长度通常不变)
+			if (currentFile == suffix) {
+				result = currentFile;
+				break; // 找到一个匹配的就停止
+			}
+			else if (currentFile.find(suffix) != std::wstring::npos && 
+				currentFile.length() == (suffix.length() + 2))
+			{
+				result = currentFile;
+				break; // 找到一个匹配的就停止
+			}
+		} while (FindNextFileW(hFind, &findData));
+
+		FindClose(hFind);
+
+		if (result.empty()) return UNKUOWN_MAYBE_DEL;
+		return result;
+	}
+
+	// --- 新增：核心过滤逻辑 ---
+	bool should_process_event(const std::wstring& full_path, DWORD action) {
+		auto now = std::chrono::steady_clock::now();
+		auto it = event_cache_.find(full_path);
+
+		// 如果是新文件（之前没记录），或者记录已经超时（为了清理内存，这里简化处理，
+		// 实际可以将超时的记录视为新记录）
+		if (it == event_cache_.end()) {
+			// 如果是新记录，总是允许，并保存状态
+			event_cache_[full_path] = { action, now };
+			clean_cache_if_needed(); // 简单的清理机制
+			return true;
+		}
+
+		auto& state = it->second;
+		long long diff_ms = std::chrono::duration_cast<std::chrono::milliseconds>(now - state.last_time).count();
+
+		// 如果时间间隔超过冷却时间，视为新的一轮操作，允许处理
+		if (diff_ms > kCooldownMs) {
+			state.last_action = action;
+			state.last_time = now;
+			return true;
+		}
+
+		// --- 进入冷却时间内的逻辑判断 ---
+
+		// 逻辑 1: 如果这次是 MODIFIED，但上次（在很短时间内）是 ADDED
+		// 意味着是 "创建后立即写入"，我们要忽略这次 MODIFIED
+		if (action == FILE_ACTION_MODIFIED && state.last_action == FILE_ACTION_ADDED) {
+			// 只更新时间，保持状态为 ADDED，这样后续连续的 MODIFIED 也会被忽略
+			state.last_time = now;
+			return false;
+		}
+
+		// 逻辑 2: 如果这次是 MODIFIED，上次也是 MODIFIED
+		// 意味着是 "连续写入"，我们要忽略后续的 MODIFIED
+		if (action == FILE_ACTION_MODIFIED && state.last_action == FILE_ACTION_MODIFIED) {
+			state.last_time = now;
+			return false;
+		}
+
+		// 其他情况（例如 ADDED，虽然理论上同一文件不会连续 ADDED，但如果发生则更新）
+		state.last_action = action;
+		state.last_time = now;
+		return true;
+	}
+
+	// 防止 map 无限增长的简单清理
+	void clean_cache_if_needed() {
+		if (event_cache_.size() > 1000) {
+			auto now = std::chrono::steady_clock::now();
+			for (auto it = event_cache_.begin(); it != event_cache_.end(); ) {
+				long long diff_ms = std::chrono::duration_cast<std::chrono::milliseconds>(now - it->second.last_time).count();
+				// 如果超过5秒没动静，就从缓存清除
+				if (diff_ms > 5000) {
+					it = event_cache_.erase(it);
+				}
+				else {
+					++it;
+				}
+			}
+		}
+	}
+	// --- 结束新增 ---
+
+	void monitor_loop() {
+		const DWORD buffer_size = 64 * 1024; // 64KB 缓冲区
+		std::vector<BYTE> buffer(buffer_size);
+		OVERLAPPED overlapped = { 0 };
+		HANDLE events[2] = { 0 };
+
+		// 创建事件用于异步操作
+		events[0] = CreateEvent(NULL, TRUE, FALSE, NULL);
+		events[1] = CreateEvent(NULL, TRUE, FALSE, NULL);
+		overlapped.hEvent = events[0];
+
+		if (!events[0] || !events[1]) {
+			std::wcerr << L"cannot create events" << std::endl;
+			return;
+		}
+
+		while (!stop_monitoring_) {
+			DWORD bytes_returned = 0;
+
+			// 开始异步监控
+			BOOL success = ReadDirectoryChangesW(
+				directory_handle_,
+				buffer.data(),
+				buffer_size,
+				TRUE, // 监控子目录
+				//FILE_NOTIFY_CHANGE_LAST_ACCESS |   // 文件访问（包括打开）
+				FILE_NOTIFY_CHANGE_FILE_NAME |     // 文件创建/删除/重命名
+				FILE_NOTIFY_CHANGE_LAST_WRITE   // 文件修改
+				//FILE_NOTIFY_CHANGE_SIZE |          // 文件大小变化
+				//FILE_NOTIFY_CHANGE_CREATION |       // 文件创建时间变化
+				//FILE_NOTIFY_CHANGE_ATTRIBUTES | 
+				//FILE_NOTIFY_CHANGE_SECURITY
+				,
+				&bytes_returned,
+				&overlapped,
+				NULL
+			);
+
+			if (!success) {
+				DWORD error = GetLastError();
+				if (error != ERROR_IO_PENDING) {
+					std::wcerr << L"ReadDirectoryChangesW failed, error code: " << error << std::endl;
+					break;
+				}
+			}
+
+			// 等待目录变化或停止信号
+			DWORD wait_result = WaitForMultipleObjects(2, events, FALSE, INFINITE);
+
+			if (wait_result == WAIT_OBJECT_0) {
+				// 目录发生变化
+				if (GetOverlappedResult(directory_handle_, &overlapped, &bytes_returned, FALSE)) {
+					if (bytes_returned > 0) {
+						process_changes(buffer.data(), bytes_returned);
+					}
+				}
+
+				// 重置事件，准备下一次监控
+				ResetEvent(events[0]);
+				overlapped.Offset = 0;
+				overlapped.OffsetHigh = 0;
+			}
+			else if (wait_result == WAIT_OBJECT_0 + 1) {
+				// 收到停止信号
+				break;
+			}
+		}
+
+		CloseHandle(events[0]);
+		CloseHandle(events[1]);
+	}
+
+	void process_changes(BYTE* buffer, DWORD buffer_size) {
+		FILE_NOTIFY_INFORMATION* notify_info = reinterpret_cast<FILE_NOTIFY_INFORMATION*>(buffer);
+
+		do {
+			std::wstring file_name(notify_info->FileName, notify_info->FileNameLength / sizeof(WCHAR));
+			std::wstring full_path = directory_path_ + L"\\" + file_name;
+			std::wstring original_name = L"";
+
+			// 1. 获取动作类型
+			DWORD current_action = notify_info->Action;
+
+			// 2. 检查是否应该处理此事件 (核心过滤逻辑)
+			// 注意：我们只过滤 ADDED 和 MODIFIED，removed 通常不需要防抖
+			bool process_it = true;
+			if (current_action == FILE_ACTION_ADDED || current_action == FILE_ACTION_MODIFIED) {
+				if (!should_process_event(full_path, current_action)) {
+					process_it = false;
+				}
+			}
+
+			if (process_it) 
+			{
+				switch (notify_info->Action) {
+					case FILE_ACTION_ADDED:
+					{
+						original_name = find_original_file(directory_path_, file_name);
+						bool is_target = is_target_file_ext(original_name);
+						if (original_name != UNKUOWN && original_name != UNKUOWN_MAYBE_DEL && original_name != UNKUOWN_NO_ORIGIN && is_target)
+						{
+							std::cout << "[create] " << WStringToString(directory_path_ + L"\\" + original_name) << std::endl;
+						}
+						break;
+					}
+					case FILE_ACTION_REMOVED:
+					{
+						// 删除事件通常不通过防抖逻辑，或者你可以选择清理 cache
+						event_cache_.erase(full_path);
+						//std::cout << "[delete] " << WStringToString(full_path) << std::endl;
+						break;
+					}
+					case FILE_ACTION_MODIFIED:
+					{
+						// 因为 should_process_event 已经过滤了多余的 MODIFIED
+						// 这里的代码只会在第一次 MODIFIED 或者 ADDED 很久之后的 MODIFIED 执行
+						// 过滤掉目录更改，只看文件
+						// 检查文件属性以确认是否是访问事件
+						DWORD attributes = GetFileAttributesW(full_path.c_str());
+						if (attributes != INVALID_FILE_ATTRIBUTES &&
+							!(attributes & FILE_ATTRIBUTE_DIRECTORY)) {
+							// 这里可以添加额外的逻辑来确认是文件打开
+							// 例如检查文件是否被特定进程锁定等
+							bool is_locked = is_file_locked_by_RM(full_path);
+							bool is_target = is_target_file_ext(full_path);
+							if (is_locked && is_target)
+							{
+								std::cout << "file modified: " << WStringToString(full_path) << std::endl;
+							}
+						}
+					}
+				}
+			}
+
+			// 移动到下一个通知
+			if (notify_info->NextEntryOffset == 0) {
+				break;
+			}
+			notify_info = reinterpret_cast<FILE_NOTIFY_INFORMATION*>(
+				reinterpret_cast<BYTE*>(notify_info) + notify_info->NextEntryOffset);
+		} while (true);
+	}
+};
+
+// 工具函数：获取更详细的文件访问信息
+bool is_file_likely_opened(const std::wstring& file_path) {
+	// 尝试以独占方式打开文件，如果失败则说明文件可能已被其他进程打开
+	HANDLE hFile = CreateFileW(
+		file_path.c_str(),
+		GENERIC_READ,
+		FILE_SHARE_READ, // 允许其他进程读取
+		NULL,
+		OPEN_EXISTING,
+		FILE_ATTRIBUTE_NORMAL,
+		NULL
+	);
+
+	if (hFile == INVALID_HANDLE_VALUE) {
+		DWORD error = GetLastError();
+		if (error == ERROR_SHARING_VIOLATION) {
+			// 文件被其他进程以独占方式打开
+			return true;
+		}
+		return false;
+	}
+
+	CloseHandle(hFile);
+	return false;
+}
+
+// 使用示例
+int main() {
+	SetConsoleOutputCP(CP_UTF8);
+
+	PWSTR path = nullptr;
+
+	// 获取桌面路径
+	// 使用 FOLDERID_Desktop
+	std::wstring desktop_path;
+	if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_Desktop, 0, NULL, &path))) {
+		desktop_path = std::wstring(path);
+		CoTaskMemFree(path); // 必须释放内存
+	}
+	std::wcout << L"Desktop path: " << desktop_path << std::endl;
+	// 获取下载文件夹路径
+	// 使用 FOLDERID_Downloads
+	std::wstring download_path;
+	if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_Downloads, 0, NULL, &path))) {
+		download_path = std::wstring(path);
+		CoTaskMemFree(path);
+	}
+	std::wcout << L"Download path: " << download_path << std::endl;
+
+	std::wstring directory_to_watch = L"C:\\Users\\CDS\\Downloads";
+
+	DirectoryMonitor download_monitor(download_path);
+
+	if (download_monitor.start()) {
+		std::cout << "beginning to monitor directory: " << WStringToString(directory_to_watch) << std::endl;
+	}
+	else {
+		std::wcerr << L"can not start download monitor" << std::endl;
+		return 1;
+	}
+	
+	DirectoryMonitor desktop_monitor(desktop_path);
+
+	if (desktop_monitor.start())
+	{
+		std::cout << "beginning to monitor directory: " << WStringToString(desktop_path) << std::endl;
+	} 
+	else
+	{
+		std::wcerr << L"can not start desktop monitor" << std::endl;
+		download_monitor.stop();
+		return 1;
+	}
+
+	std::cin.get(); // 等待用户输入
+
+	download_monitor.stop();
+	desktop_monitor.stop();
+
+	std::cout << "all monitor already stopped" << std::endl;
+
+	return 0;
+}
