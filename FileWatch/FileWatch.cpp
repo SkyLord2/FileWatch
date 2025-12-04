@@ -436,12 +436,10 @@ int main() {
 	}
 	std::wcout << L"Download path: " << download_path << std::endl;
 
-	std::wstring directory_to_watch = L"C:\\Users\\CDS\\Downloads";
-
 	DirectoryMonitor download_monitor(download_path);
 
 	if (download_monitor.start()) {
-		std::cout << "beginning to monitor directory: " << WStringToString(directory_to_watch) << std::endl;
+		std::cout << "beginning to monitor directory: " << WStringToString(download_path) << std::endl;
 	}
 	else {
 		std::wcerr << L"can not start download monitor" << std::endl;
