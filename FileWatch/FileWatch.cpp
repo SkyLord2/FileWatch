@@ -11,6 +11,8 @@
 #include <set>
 #include <chrono>
 #include <filesystem>
+#include <mutex>
+#include <queue>
 #include <restartmanager.h>
 
 #pragma comment(lib, "Rstrtmgr.lib")
@@ -26,6 +28,19 @@ static std::set<std::wstring> target_extensions = {
 v8::Isolate* isolate = NULL;
 v8::Local<v8::Function> logCallback;
 v8::Local<v8::Function> fileCallback;
+
+static uv_async_t async_log_handle;
+// 存储日志信息 (需要线程安全)
+struct FileMessage {
+	std::wstring message;
+	std::wstring type;
+	std::wstring path;
+	int messageType;
+	// 可能还需要一个类型指示器 (Info/Error)
+};
+
+std::mutex log_mutex;
+std::queue<FileMessage> log_queue;
 
 std::string WcharToUtf8(const wchar_t* wstr) {
 	if (wstr == nullptr) return "";
@@ -58,7 +73,15 @@ std::wstring Utf8ToWstring(const std::string& utf8Str) {
 	return std::wstring(wchars.begin(), wchars.end());
 }
 
-static void LogFunc(const std::wstring& info) {
+static void LogBase(const std::wstring& info) {
+	if (isolate == NULL)
+	{
+		std::wcerr << L"isolate is null" << std::endl;
+		return;
+	}
+	// 声明 HandleScope，确保局部 V8 对象的安全创建
+	v8::HandleScope handle_scope(isolate);
+
 	std::string logStr = WcharToUtf8(info.c_str());
 	v8::Local<v8::Value> argv[1] = {
 		v8::String::NewFromUtf8(isolate, logStr.c_str()).ToLocalChecked()
@@ -78,6 +101,19 @@ static void LogFunc(const std::wstring& info) {
 		1, argv).ToLocalChecked();
 }
 
+static void LogFunc(const std::wstring& info) {
+	std::wcout << info << std::endl;
+	// 1. 将日志信息放入线程安全队列
+	{
+		std::lock_guard<std::mutex> lock(log_mutex);
+		log_queue.push({ info, L"", L"", 0 });
+	}
+
+	// 2. 触发 Libuv 事件，通知主线程执行 AsyncLogCallback
+	// 这是安全的，因为它只发送一个信号，不涉及 V8 对象。
+	uv_async_send(&async_log_handle);
+}
+
 void LogError(const std::wstring& error) {
 	std::wstring logInfo = L"[file watch error] " + error;
 	LogFunc(logInfo);
@@ -88,13 +124,90 @@ void LogInfo(const std::wstring& info) {
 	LogFunc(logInfo);
 }
 
+static void asyncReport(const std::wstring& type, const std::wstring& path) {
+	std::wcout << path << std::endl;
+	// 1. 将日志信息放入线程安全队列
+	{
+		std::lock_guard<std::mutex> lock(log_mutex);
+		log_queue.push({ L"", type, path, 1});
+	}
+
+	// 2. 触发 Libuv 事件，通知主线程执行 AsyncLogCallback
+	// 这是安全的，因为它只发送一个信号，不涉及 V8 对象。
+	uv_async_send(&async_log_handle);
+}
+
+static void reportBase(const std::wstring& type, const std::wstring& path) {
+	if (isolate == NULL)
+	{
+		std::wcerr << L"isolate is null" << std::endl;
+		return;
+	}
+	// 声明 HandleScope，确保局部 V8 对象的安全创建
+	v8::HandleScope handle_scope(isolate);
+
+	std::string typeStr = WcharToUtf8(type.c_str());
+	std::string pathStr = WcharToUtf8(path.c_str());
+	v8::Local<v8::Value> argv[2] = {
+		v8::String::NewFromUtf8(isolate, typeStr.c_str()).ToLocalChecked(),
+		v8::String::NewFromUtf8(isolate, pathStr.c_str()).ToLocalChecked()
+	};
+	if (fileCallback->IsNull() || fileCallback->IsUndefined())
+	{
+		std::wcerr << L"fileCallback is null" << std::endl;
+		return;
+	}
+	if (isolate == NULL)
+	{
+		std::wcerr << L"isolate is null" << std::endl;
+		return;
+	}
+	fileCallback->Call(isolate->GetCurrentContext(),
+		Null(isolate),
+		2, argv).ToLocalChecked();
+}
+
+// 异步回调：在 Node.js 主线程上执行
+static void AsyncLogCallback(uv_async_t* handle) {
+	// 必须在这里创建 HandleScope 
+	v8::HandleScope handle_scope(isolate);
+
+	// 从队列中取出所有等待的日志消息
+	std::lock_guard<std::mutex> lock(log_mutex);
+
+	while (!log_queue.empty()) {
+		FileMessage msg = log_queue.front();
+		log_queue.pop();
+
+		// 调用原始的 LogFunc (现在它在主线程上是安全的)
+		// 注意：LogFunc 内部需要被修改，不再需要锁和 HandleScope，因为它现在是被主线程调用的。
+		// 为了避免修改 LogFunc，我们在这里直接调用其逻辑：
+		//std::string logStr = WcharToUtf8(msg.message.c_str());
+
+		// ... (V8 调用逻辑，使用 logCallback 和 isolate) ...
+		if (msg.messageType == 0)
+		{
+			LogBase(msg.message);
+		}
+		else
+		{
+			reportBase(msg.type, msg.path);
+		}
+	}
+}
+
 static void OnExit(void* arg) {
 	std::wcout << L"\nMonitoring stopped by process exit" << std::endl;
 }
 
-bool is_target_file_ext(std::wstring file_name) {
+std::filesystem::path get_file_ext(std::wstring file_name) {
 	std::filesystem::path file_path = file_name;
 	std::filesystem::path ext = file_path.extension();
+    return ext;
+}
+
+bool is_target_file_ext(std::wstring file_name) {
+	std::filesystem::path ext = get_file_ext(file_name);
 
 	// 2. 检查是否有扩展名
 	if (ext.empty()) {
@@ -422,7 +535,10 @@ private:
 						bool is_target = is_target_file_ext(original_name);
 						if (original_name != UNKUOWN && original_name != UNKUOWN_MAYBE_DEL && original_name != UNKUOWN_NO_ORIGIN && is_target)
 						{
-							std::cout << "[create] " << WStringToString(directory_path_ + L"\\" + original_name) << std::endl;
+							std::wstring path = directory_path_ + L"\\" + original_name;
+							std::cout << "[create] " << WStringToString(path) << std::endl;
+							std::filesystem::path ext = get_file_ext(file_name);
+							asyncReport(ext.wstring(), path);
 						}
 						break;
 					}
@@ -449,6 +565,8 @@ private:
 							if (is_locked && is_target)
 							{
 								std::cout << "file modified: " << WStringToString(full_path) << std::endl;
+								std::filesystem::path ext = get_file_ext(full_path);
+								asyncReport(ext.wstring(), full_path);
 							}
 						}
 					}
@@ -465,7 +583,7 @@ private:
 	}
 };
 
-std::vector<DirectoryMonitor> monitors;
+std::vector<std::shared_ptr<DirectoryMonitor>> monitors;
 // 工具函数：获取更详细的文件访问信息
 bool is_file_likely_opened(const std::wstring& file_path) {
 	// 尝试以独占方式打开文件，如果失败则说明文件可能已被其他进程打开
@@ -522,6 +640,8 @@ static void WatchInitialize(const v8::FunctionCallbackInfo<v8::Value>& args) {
 			v8::String::NewFromUtf8(isolate, "第四个参数必须是回调函数").ToLocalChecked()));
 		return;
 	}
+
+	uv_async_init(uv_default_loop(), &async_log_handle, AsyncLogCallback);
 
 	node::Environment* env = node::GetCurrentEnvironment(isolate->GetCurrentContext());
 	if (env)
@@ -583,17 +703,22 @@ static void WatchInitialize(const v8::FunctionCallbackInfo<v8::Value>& args) {
 	for (std::wstring wspath : targetDirectory) {
 		vectorContents += wspath + L" ";
 		// 监听目录
-		DirectoryMonitor monitor(wspath);
-		if (monitor.start()) {
-			std::cout << "beginning to monitor directory: " << WStringToString(wspath) << std::endl;
+		std::shared_ptr<DirectoryMonitor> monitor_ptr = std::make_shared<DirectoryMonitor>(wspath);
+		if (monitor_ptr->start()) {
+			LogInfo(L"beginning to monitor directory: " + wspath);
+			monitors.push_back(monitor_ptr);
 		}
-		else {
-			std::cerr << "start monitor " << WStringToString(wspath) << L" failed" << std::endl;
+		else 
+		{
+			LogError(wspath + L", start monitor failed");
 		}
-		monitor.join();
-		monitors.push_back(monitor);
 	}
 	LogInfo(L"Target directories: " + vectorContents);
+
+	for (std::shared_ptr<DirectoryMonitor> monitor : monitors)
+	{
+		monitor->join();
+	}
 }
 
 static void HandleExist(uv_signal_s* handle, int signal) {
