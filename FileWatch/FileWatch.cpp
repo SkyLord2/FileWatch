@@ -1,4 +1,6 @@
-﻿#include <windows.h>
+﻿#include <node.h>
+#include <uv.h>
+#include <windows.h>
 #include <shlobj.h>
 #include <iostream>
 #include <string>
@@ -17,9 +19,78 @@
 #define UNKUOWN_NO_ORIGIN	L"unknown_no_original_file_found"
 #define UNKUOWN_MAYBE_DEL	L"unknown_maybe_delete"
 
-static const std::set<std::wstring> target_extensions = {
+static std::set<std::wstring> target_extensions = {
 	L".txt", L".doc", L".docx", L".pdf", L".xls", L".xlsx", L".ppt", L".pptx"
 };
+
+v8::Isolate* isolate = NULL;
+v8::Local<v8::Function> logCallback;
+v8::Local<v8::Function> fileCallback;
+
+std::string WcharToUtf8(const wchar_t* wstr) {
+	if (wstr == nullptr) return "";
+	int size_needed = WideCharToMultiByte(CP_UTF8, 0, wstr, -1, nullptr, 0, nullptr, nullptr);
+	if (size_needed == 0) return "";
+
+	std::string result(size_needed, 0);
+	WideCharToMultiByte(CP_UTF8, 0, wstr, -1, &result[0], size_needed, nullptr, nullptr);
+	// 移除末尾的 null 终止符
+	if (!result.empty() && result[result.size() - 1] == '\0') {
+		result.pop_back();
+	}
+	return result;
+}
+
+std::wstring Utf8ToWstring(const std::string& utf8Str) {
+	if (utf8Str.empty()) return L"";
+
+	int wchars_count = MultiByteToWideChar(CP_UTF8, 0, utf8Str.c_str(), -1, nullptr, 0);
+	if (wchars_count == 0) return L"";
+
+	std::vector<wchar_t> wchars(wchars_count);
+	MultiByteToWideChar(CP_UTF8, 0, utf8Str.c_str(), -1, wchars.data(), wchars_count);
+
+	// 移除末尾的 null 终止符
+	if (!wchars.empty() && wchars[wchars.size() - 1] == L'\0') {
+		wchars.pop_back();
+	}
+
+	return std::wstring(wchars.begin(), wchars.end());
+}
+
+static void LogFunc(const std::wstring& info) {
+	std::string logStr = WcharToUtf8(info.c_str());
+	v8::Local<v8::Value> argv[1] = {
+		v8::String::NewFromUtf8(isolate, logStr.c_str()).ToLocalChecked()
+	};
+	if (logCallback->IsNull() || logCallback->IsUndefined())
+	{
+		std::wcerr << L"logCallback is null" << std::endl;
+		return;
+	}
+	if (isolate == NULL)
+	{
+		std::wcerr << L"isolate is null" << std::endl;
+		return;
+	}
+	logCallback->Call(isolate->GetCurrentContext(),
+		Null(isolate),
+		1, argv).ToLocalChecked();
+}
+
+void LogError(const std::wstring& error) {
+	std::wstring logInfo = L"[file watch error] " + error;
+	LogFunc(logInfo);
+}
+
+void LogInfo(const std::wstring& info) {
+	std::wstring logInfo = L"[file watch info] " + info;
+	LogFunc(logInfo);
+}
+
+static void OnExit(void* arg) {
+	std::wcout << L"\nMonitoring stopped by process exit" << std::endl;
+}
 
 bool is_target_file_ext(std::wstring file_name) {
 	std::filesystem::path file_path = file_name;
@@ -125,6 +196,13 @@ public:
 		stop_monitoring_ = false;
 		monitor_thread_ = std::thread(&DirectoryMonitor::monitor_loop, this);
 		return true;
+	}
+
+	void join() {
+		if (monitor_thread_.joinable())
+		{
+			monitor_thread_.join();
+		}
 	}
 
 	void stop() {
@@ -387,6 +465,7 @@ private:
 	}
 };
 
+std::vector<DirectoryMonitor> monitors;
 // 工具函数：获取更详细的文件访问信息
 bool is_file_likely_opened(const std::wstring& file_path) {
 	// 尝试以独占方式打开文件，如果失败则说明文件可能已被其他进程打开
@@ -413,7 +492,126 @@ bool is_file_likely_opened(const std::wstring& file_path) {
 	return false;
 }
 
+static void WatchInitialize(const v8::FunctionCallbackInfo<v8::Value>& args) {
+	isolate = args.GetIsolate();
+
+	v8::Local<v8::Context> context = isolate->GetCurrentContext();
+	// 检查参数是否有效
+	if (args.Length() < 4) {
+		isolate->ThrowException(v8::Exception::TypeError(
+			v8::String::NewFromUtf8(isolate, "必须传入两个回调函数和一个字符串数组").ToLocalChecked()));
+		return;
+	}
+	if (!args[0]->IsArray()) {
+		isolate->ThrowException(v8::Exception::TypeError(
+			v8::String::NewFromUtf8(isolate, "第一个参数必须是字符串数组").ToLocalChecked()));
+		return;
+	}
+	if (!args[1]->IsArray()) {
+		isolate->ThrowException(v8::Exception::TypeError(
+			v8::String::NewFromUtf8(isolate, "第二个参数必须是字符串数组").ToLocalChecked()));
+		return;
+	}
+	if (!args[2]->IsFunction()) {
+		isolate->ThrowException(v8::Exception::TypeError(
+			v8::String::NewFromUtf8(isolate, "第三个参数必须是回调函数").ToLocalChecked()));
+		return;
+	}
+	if (!args[3]->IsFunction()) {
+		isolate->ThrowException(v8::Exception::TypeError(
+			v8::String::NewFromUtf8(isolate, "第四个参数必须是回调函数").ToLocalChecked()));
+		return;
+	}
+
+	node::Environment* env = node::GetCurrentEnvironment(isolate->GetCurrentContext());
+	if (env)
+	{
+		node::AtExit(env, OnExit, nullptr);
+	}
+	else {
+		std::cerr << "env is null" << std::endl;
+		LogError(L"env is null");
+	}
+
+
+	fileCallback = v8::Local<v8::Function>::Cast(args[2]);
+	logCallback = v8::Local<v8::Function>::Cast(args[3]);
+
+	v8::Local<v8::Array> jsArray = v8::Local<v8::Array>::Cast(args[0]);
+	uint32_t arrayLength = jsArray->Length();
+	std::set<std::wstring> targetExtensions;
+
+	for (uint32_t i = 0; i < arrayLength; i++) {
+		v8::Local<v8::Value> element;
+		if (jsArray->Get(context, i).ToLocal(&element)) {
+			if (element->IsString()) {
+				// 将JavaScript字符串转换为std::string
+				v8::String::Utf8Value utf8Str(isolate, element);
+				if (*utf8Str) {
+					// 转换为std::wstring并添加到集合
+					std::wstring wstr = Utf8ToWstring(*utf8Str);
+					targetExtensions.insert(wstr);
+				}
+			}
+		}
+	}
+	target_extensions = targetExtensions;
+	std::wstring setContents;
+	for (std::wstring wstr : targetExtensions) {
+		setContents += wstr + L" ";
+	}
+	LogInfo(L"Target extensions: " + setContents);
+
+	std::vector<std::wstring> targetDirectory;
+	jsArray = v8::Local<v8::Array>::Cast(args[1]);
+	arrayLength = jsArray->Length();
+	for (uint32_t i = 0; i < arrayLength; i++) {
+		v8::Local<v8::Value> element;
+		if (jsArray->Get(context, i).ToLocal(&element)) {
+			if (element->IsString()) {
+				// 将JavaScript字符串转换为std::string
+				v8::String::Utf8Value utf8Str(isolate, element);
+				if (*utf8Str) {
+					// 转换为std::wstring并添加到集合
+					std::wstring wspath = Utf8ToWstring(*utf8Str);
+					targetDirectory.push_back(wspath);
+				}
+			}
+		}
+	}
+	std::wstring vectorContents;
+	for (std::wstring wspath : targetDirectory) {
+		vectorContents += wspath + L" ";
+		// 监听目录
+		DirectoryMonitor monitor(wspath);
+		if (monitor.start()) {
+			std::cout << "beginning to monitor directory: " << WStringToString(wspath) << std::endl;
+		}
+		else {
+			std::cerr << "start monitor " << WStringToString(wspath) << L" failed" << std::endl;
+		}
+		monitor.join();
+		monitors.push_back(monitor);
+	}
+	LogInfo(L"Target directories: " + vectorContents);
+}
+
+static void HandleExist(uv_signal_s* handle, int signal) {
+	LogInfo(L"file watch stopped by user");
+}
+
+void Initialize(v8::Local<v8::Object> exports) {
+	NODE_SET_METHOD(exports, "WatchInitialize", WatchInitialize);
+
+	uv_signal_t* signalHandler = new uv_signal_t;
+	uv_signal_init(uv_default_loop(), signalHandler);
+	uv_signal_start(signalHandler, HandleExist, SIGTERM);
+}
+
+NODE_MODULE(NODE_GYP_MODULE_NAME, Initialize)
+
 // 使用示例
+/*
 int main() {
 	SetConsoleOutputCP(CP_UTF8);
 
@@ -468,3 +666,4 @@ int main() {
 
 	return 0;
 }
+*/
