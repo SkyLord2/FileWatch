@@ -26,8 +26,8 @@ static std::set<std::wstring> target_extensions = {
 };
 
 v8::Isolate* isolate = NULL;
-v8::Local<v8::Function> logCallback;
-v8::Local<v8::Function> fileCallback;
+v8::Persistent<v8::Function> logCallback_persistent;
+v8::Persistent<v8::Function> fileCallback_persistent;
 
 static uv_async_t async_log_handle;
 // 存储日志信息 (需要线程安全)
@@ -86,7 +86,8 @@ static void LogBase(const std::wstring& info) {
 	v8::Local<v8::Value> argv[1] = {
 		v8::String::NewFromUtf8(isolate, logStr.c_str()).ToLocalChecked()
 	};
-	if (logCallback->IsNull() || logCallback->IsUndefined())
+	v8::Local<v8::Function> logCallback_local = logCallback_persistent.Get(isolate);
+	if (logCallback_local.IsEmpty() || logCallback_local->IsNull() || logCallback_local->IsUndefined())
 	{
 		std::wcerr << L"logCallback is null" << std::endl;
 		return;
@@ -96,7 +97,7 @@ static void LogBase(const std::wstring& info) {
 		std::wcerr << L"isolate is null" << std::endl;
 		return;
 	}
-	logCallback->Call(isolate->GetCurrentContext(),
+	logCallback_local->Call(isolate->GetCurrentContext(),
 		Null(isolate),
 		1, argv).ToLocalChecked();
 }
@@ -125,7 +126,7 @@ void LogInfo(const std::wstring& info) {
 }
 
 static void asyncReport(const std::wstring& type, const std::wstring& path) {
-	std::wcout << path << std::endl;
+	std::wcout << L"asyncReport: " << type << L", " << path << std::endl;
 	// 1. 将日志信息放入线程安全队列
 	{
 		std::lock_guard<std::mutex> lock(log_mutex);
@@ -152,17 +153,13 @@ static void reportBase(const std::wstring& type, const std::wstring& path) {
 		v8::String::NewFromUtf8(isolate, typeStr.c_str()).ToLocalChecked(),
 		v8::String::NewFromUtf8(isolate, pathStr.c_str()).ToLocalChecked()
 	};
-	if (fileCallback->IsNull() || fileCallback->IsUndefined())
+	v8::Local<v8::Function> fileCallback_local = fileCallback_persistent.Get(isolate);
+	if (fileCallback_local.IsEmpty() || fileCallback_local->IsNull() || fileCallback_local->IsUndefined())
 	{
 		std::wcerr << L"fileCallback is null" << std::endl;
 		return;
 	}
-	if (isolate == NULL)
-	{
-		std::wcerr << L"isolate is null" << std::endl;
-		return;
-	}
-	fileCallback->Call(isolate->GetCurrentContext(),
+	fileCallback_local->Call(isolate->GetCurrentContext(),
 		Null(isolate),
 		2, argv).ToLocalChecked();
 }
@@ -197,7 +194,9 @@ static void AsyncLogCallback(uv_async_t* handle) {
 }
 
 static void OnExit(void* arg) {
-	std::wcout << L"\nMonitoring stopped by process exit" << std::endl;
+	logCallback_persistent.Reset();
+	fileCallback_persistent.Reset();
+	std::wcout << L"Monitoring stopped by process exit" << std::endl;
 }
 
 std::filesystem::path get_file_ext(std::wstring file_name) {
@@ -649,13 +648,14 @@ static void WatchInitialize(const v8::FunctionCallbackInfo<v8::Value>& args) {
 		node::AtExit(env, OnExit, nullptr);
 	}
 	else {
-		std::cerr << "env is null" << std::endl;
 		LogError(L"env is null");
 	}
 
 
-	fileCallback = v8::Local<v8::Function>::Cast(args[2]);
-	logCallback = v8::Local<v8::Function>::Cast(args[3]);
+	v8::Local<v8::Function> fileCallback_local = v8::Local<v8::Function>::Cast(args[2]);
+	v8::Local<v8::Function> logCallback_local = v8::Local<v8::Function>::Cast(args[3]);
+	fileCallback_persistent.Reset(isolate, fileCallback_local);
+	logCallback_persistent.Reset(isolate, logCallback_local);
 
 	v8::Local<v8::Array> jsArray = v8::Local<v8::Array>::Cast(args[0]);
 	uint32_t arrayLength = jsArray->Length();
@@ -715,10 +715,10 @@ static void WatchInitialize(const v8::FunctionCallbackInfo<v8::Value>& args) {
 	}
 	LogInfo(L"Target directories: " + vectorContents);
 
-	for (std::shared_ptr<DirectoryMonitor> monitor : monitors)
+	/*for (std::shared_ptr<DirectoryMonitor> monitor : monitors)
 	{
 		monitor->join();
-	}
+	}*/
 }
 
 static void HandleExist(uv_signal_s* handle, int signal) {
